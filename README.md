@@ -22,3 +22,19 @@ Benchmark comparing this with simple LinkedList with 1 element per list node:
 |Fast LL Iterator|2280390|528.3 ns/op|72 B/op|5 allocs/op|
 |Fast LL for-loop|16261704|67.17 ns/op|0 B/op|0 allocs/op|
 |Slow LL for-loop|9322726|126.0 ns/op|0 B/op|0 allocs/op|
+
+```go
+// 3 is an internal capacity of the slices
+list := NewLinkedList[string](3)
+
+list.PushTail("hello", "world", "hello2", "DOESN'T FIT")
+
+slices.Equal(list.chunk.values, []string{"hello", "world", "hello2"})
+// 4th string is in the second chunk
+slices.Equal(list.chunk.next.values, []string{"DOESN'T FIT"})
+
+// Iterator API
+for idx, elem := range list.Iterator() {
+	fmt.Printf("%v, %v\n", idx, elem)
+}
+```
