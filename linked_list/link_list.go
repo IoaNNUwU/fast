@@ -6,157 +6,224 @@ import (
 )
 
 // LinkedList optimized for fast iteration and random insertion.
-//
-// LinkedList consists of ListChunk's connected by pointers in 1 direction.
-//
-// ListChunk manages slice of values which allows fast iteration over Linked List.
+// Consists of ListChunks connected by a singly linked list.
+// Each chunk holds a slice of values, which speeds up iteration.
 type LinkedList[T any] struct {
-	chunk *ListChunk[T]
+	head *ListChunk[T]
 }
 
-// Creates new LinkedList with specified slice capacity.
-// This LinkedList internally uses chunks of slices connected by pointers.
-func NewLinkedList[T any](slice_cap int) LinkedList[T] {
-	return LinkedList[T]{
-		chunk: chunk[T](slice_cap),
-	}
+const defaultChunkCap = 128
+
+func NewLinkedList[T any](chunkCap int) LinkedList[T] {
+	return LinkedList[T]{head: newChunk[T](chunkCap)}
 }
 
-// Creates new LinkedList with default slice capacity of 128
 func DefaultLinkedList[T any]() LinkedList[T] {
-	return NewLinkedList[T](128)
+	return NewLinkedList[T](defaultChunkCap)
 }
 
-// Returns number of elements in LinkedList
+// Length returns the total number of elements in the list.
 func (l LinkedList[T]) Length() int {
-	if l.chunk.next != nil {
-		return l.chunk.next.lenTail() + len(l.chunk.values)
-	} else {
-		return len(l.chunk.values)
+	total := 0
+	for chunk := range l.Chunks() {
+		total += len(chunk.values)
+	}
+	return total
+}
+
+// PushTail appends values to the end of the list.
+func (l LinkedList[T]) PushTail(values ...T) {
+	// Find the last chunk
+	last := l.head
+	for last.next != nil {
+		last = last.next
+	}
+
+	for _, value := range values {
+		if last.isFull() {
+			last.next = newChunk[T](cap(last.values))
+			last = last.next
+		}
+		last.values = append(last.values, value)
 	}
 }
 
-func (l LinkedList[T]) PushTail(values ...T) {
-	l.chunk.pushTail(values...)
-}
-
+// PushHead prepends values to the beginning of the list (order is preserved).
 func (l LinkedList[T]) PushHead(values ...T) {
-	for _, value := range values {
-		if !l.chunk.isFull() {
-			l.chunk.values = slices.Insert(l.chunk.values, 0, value)
+	for i := len(values) - 1; i >= 0; i-- {
+		value := values[i]
+		if !l.head.isFull() {
+			l.head.values = slices.Insert(l.head.values, 0, value)
 		} else {
-			old_values := l.chunk.values
-			old_next := l.chunk.next
+			newHead := newChunk[T](cap(l.head.values))
+			newHead.next = l.head.next
+			newHead.values = l.head.values
 
-			new_chunk := chunk[T](cap(l.chunk.values))
-			new_chunk.next = old_next
-			new_chunk.values = old_values
-
-			l.chunk.next = new_chunk
-			l.chunk.values = []T{value}
+			l.head.next = newHead
+			l.head.values = []T{value}
 		}
 	}
 }
 
-// Adds a value to any empty space inside this list.
-//
-// Tries to reuse already allocated space up until rec_limit times,
-// then falls back to PushHead().
-func (l LinkedList[T]) PushUnordered(rec_limit int, value T) {
-
-	next_chunk, stop := iter.Pull(l.Chunks())
+// PushUnordered inserts a value into the first non-full chunk found.
+// Scans at most recLimit chunks before falling back to PushHead.
+func (l LinkedList[T]) PushUnordered(recLimit int, value T) {
+	nextChunk, stop := iter.Pull(l.Chunks())
 	defer stop()
 
-	for range rec_limit {
-		chunk, ok := next_chunk()
-
-		if ok && !chunk.isFull() {
+	for range recLimit {
+		chunk, ok := nextChunk()
+		if !ok {
+			break
+		}
+		if !chunk.isFull() {
 			chunk.values = append(chunk.values, value)
 			return
 		}
 	}
+
 	l.PushHead(value)
 }
 
-// Returns an iterator over incices and values
-func (l LinkedList[T]) Iterator() func(yield func(int, T) bool) {
-	pointer := l.chunk
-	idx_accum := 0
+// Set sets a value at the given global index across all chunks.
+// Returns false if the index is out of bounds.
+func (l LinkedList[T]) Set(globalIdx int, value T) bool {
+	if globalIdx < 0 {
+		return false
+	}
+	offset := 0
+	for chunk := range l.Chunks() {
+		chunkLen := len(chunk.values)
+		if globalIdx < offset+chunkLen {
+			chunk.values[globalIdx-offset] = value
+			return true
+		}
+		offset += chunkLen
+	}
+	return false
+}
 
+// Get returns a value at the given global index across all chunks.
+// Returns the value and false if the index is out of bounds.
+func (l LinkedList[T]) Get(globalIdx int) (T, bool) {
+	if globalIdx < 0 {
+		var zero T
+		return zero, false
+	}
+
+	offset := 0
+	for chunk := range l.Chunks() {
+		chunkLen := len(chunk.values)
+		if globalIdx < offset+chunkLen {
+			return chunk.values[globalIdx-offset], true
+		}
+		offset += chunkLen
+	}
+
+	var zero T
+	return zero, false
+}
+// Delete removes a value at the given global index across all chunks.
+// Returns false if the index is out of bounds.
+func (l *LinkedList[T]) Delete(globalIdx int) bool {
+	if globalIdx < 0 {
+		return false
+	}
+
+	offset := 0
+	for chunk := range l.Chunks() {
+		chunkLen := len(chunk.values)
+		if globalIdx < offset+chunkLen {
+			localIdx := globalIdx - offset
+
+			copy(chunk.values[localIdx:], chunk.values[localIdx+1:])
+
+			// Zeroing last element for GC to collect
+			var zero T
+			chunk.values[len(chunk.values)-1] = zero
+			chunk.values = chunk.values[:len(chunk.values)-1]
+
+			if len(chunk.values) == 0 {
+				l.removeChunk(chunk)
+			}
+
+			return true
+		}
+		offset += chunkLen
+	}
+
+	return false
+}
+
+// removeChunk removes an empty chunk from the linked list.
+func (l *LinkedList[T]) removeChunk(target *ListChunk[T]) {
+	if l.head == target {
+		if l.head.next != nil {
+			l.head.values = l.head.next.values
+			l.head.next = l.head.next.next
+		} else {
+			l.head.values = []T{}
+		}
+		return
+	}
+
+	for chunk := range l.Chunks() {
+		if chunk.next == target {
+			chunk.next = target.next
+			return
+		}
+	}
+}
+
+// Iterator returns an iterator over all elements with their global indices.
+func (l LinkedList[T]) Iterator() func(yield func(int, T) bool) {
 	return func(yield func(int, T) bool) {
-		for pointer != nil {
-			for idx, value := range pointer.values {
-				if !yield(idx_accum+idx, value) {
+		globalIdx := 0
+		for chunk := range l.Chunks() {
+			for localIdx, value := range chunk.values {
+				if !yield(globalIdx+localIdx, value) {
 					return
 				}
 			}
-			idx_accum += len(pointer.values)
-			pointer = pointer.next
+			globalIdx += len(chunk.values)
 		}
 	}
 }
 
-// Returns an iterator over incices and values
+// Chunks returns an iterator over all chunks in the list.
 func (l LinkedList[T]) Chunks() func(yield func(*ListChunk[T]) bool) {
-	pointer := l.chunk
 	return func(yield func(*ListChunk[T]) bool) {
-		for pointer != nil {
-			if !yield(pointer) {
+		for current := l.head; current != nil; current = current.next {
+			if !yield(current) {
 				return
 			}
-			pointer = pointer.next
 		}
 	}
 }
 
-// ListChunk is a building block of LinkedList. Chunks are connected together by pointers.
-//
-// ListChunk manages slice of values which allows fast iteration over Linked List.
+// ListChunk is a building block of LinkedList.
+// Holds a slice of values and a pointer to the next chunk.
 type ListChunk[T any] struct {
 	next   *ListChunk[T]
 	values []T
 }
 
-func (l *ListChunk[T]) lenTail() int {
-	if l.next != nil {
-		return len(l.values) + l.next.lenTail()
-	} else {
-		return len(l.values)
-	}
+func (c *ListChunk[T]) isFull() bool {
+	return len(c.values) == cap(c.values)
 }
 
-// Pushes a value to a tail of the list
-func (c *ListChunk[T]) pushTail(values ...T) {
-	for _, value := range values {
-		if c.next != nil {
-			c.next.pushTail(value)
-		} else {
-			if !c.isFull() {
-				c.values = append(c.values, value)
-			} else {
-				c.next = chunk[T](cap(c.values))
-				c.next.pushTail(value)
-			}
-		}
-	}
+// SetLocal sets a value at the given local index within the chunk.
+func (c *ListChunk[T]) SetLocal(idx int, value T) {
+	c.values[idx] = value
 }
 
-func (l *ListChunk[T]) isFull() bool {
-	return cap(l.values) == len(l.values)
+// DeleteLocal removes an element at the given local index within the chunk.
+func (c *ListChunk[T]) DeleteLocal(idx int) {
+	c.values = slices.Delete(c.values, idx, idx+1)
 }
 
-func (l *ListChunk[T]) SetLocal(idx int, value T) {
-	l.values[idx] = value
-}
-
-func (l *ListChunk[T]) DeleteLocal(idx int) {
-	_ = slices.Delete(l.values, idx, idx)
-}
-
-// slice_cap argument gets saved internally as capacity of LinkedList.Values
-// and gets reused for next list chunks.
-func chunk[T any](slice_cap int) *ListChunk[T] {
+func newChunk[T any](chunkCap int) *ListChunk[T] {
 	return &ListChunk[T]{
-		values: make([]T, 0, slice_cap),
+		values: make([]T, 0, chunkCap),
 	}
 }
